@@ -123,7 +123,7 @@ class ExportThread(QThread):
     progress = pyqtSignal(int, int)
     finished = pyqtSignal(bool, str)
     
-    def __init__(self, output_path, pages_roots, pages_perms, image_paths, title, image_crop_states):
+    def __init__(self, output_path, pages_roots, pages_perms, image_paths, title, image_crop_states, show_labels, gap_px, label_bold, label_size_ratio):
         super().__init__()
         self.output_path = output_path
         self.pages_roots = pages_roots
@@ -131,6 +131,10 @@ class ExportThread(QThread):
         self.image_paths = image_paths
         self.title = title
         self.image_crop_states = image_crop_states
+        self.show_labels = show_labels
+        self.gap_px = gap_px
+        self.label_bold = label_bold
+        self.label_size_ratio = label_size_ratio
         self.export_W = 2480
         self.export_H = 3508
         
@@ -149,9 +153,12 @@ class ExportThread(QThread):
                     images=self.image_paths,
                     perm=perm,
                     page_margin_px=120,
-                    gap_px=40,
+                    gap_px=self.gap_px,
                     title=self.title,
-                    crop_states=self.image_crop_states
+                    crop_states=self.image_crop_states,
+                    show_labels=self.show_labels,
+                    label_bold=self.label_bold,
+                    label_size_ratio=self.label_size_ratio
                 )
                 pdf_pages.append(page_img)
                 self.progress.emit(i + 1, total)
@@ -227,6 +234,10 @@ class AlbumWindow(QMainWindow):
         self.current_folder: Optional[Path] = None
         self.image_metadata: List[sa.ImageMetadata] = []
         self.image_crop_states: Dict[int, bool] = {} # img_idx -> bool (True=Crop, False=Fit)
+        self.show_labels = True
+        self.label_bold = False
+        self.label_size_ratio = 0.5
+        self.image_gap = 10
         self.pages_roots: List[Optional[sa.Node]] = []
         self.pages_perms: List[List[int]] = [] # Each is Maps leaf_id -> image_idx
         self.pages_locks: List[Dict[int, int]] = [] # Each is leaf_id -> image_idx
@@ -320,6 +331,37 @@ class AlbumWindow(QMainWindow):
         steps_row.addWidget(steps_label)
         steps_row.addWidget(self.steps_spin)
         right_layout.addLayout(steps_row)
+
+        # Labels and Gap
+        label_gap_row = QHBoxLayout()
+        self.show_labels_cb = QCheckBox("Show Filenames")
+        self.show_labels_cb.setChecked(self.show_labels)
+        self.show_labels_cb.toggled.connect(self.on_show_labels_toggled)
+        
+        self.label_bold_cb = QCheckBox("Bold")
+        self.label_bold_cb.setChecked(self.label_bold)
+        self.label_bold_cb.toggled.connect(self.on_label_bold_toggled)
+
+        label_size_label = QLabel("Size %")
+        self.label_size_spin = QSpinBox()
+        self.label_size_spin.setRange(10, 100)
+        self.label_size_spin.setValue(int(self.label_size_ratio * 100))
+        self.label_size_spin.valueChanged.connect(self.on_label_size_changed)
+        
+        gap_label = QLabel("Gap")
+        self.gap_spin = QSpinBox()
+        self.gap_spin.setRange(0, 100)
+        self.gap_spin.setValue(self.image_gap)
+        self.gap_spin.valueChanged.connect(self.on_gap_changed)
+        
+        label_gap_row.addWidget(self.show_labels_cb)
+        label_gap_row.addWidget(self.label_bold_cb)
+        label_gap_row.addStretch()
+        label_gap_row.addWidget(label_size_label)
+        label_gap_row.addWidget(self.label_size_spin)
+        label_gap_row.addWidget(gap_label)
+        label_gap_row.addWidget(self.gap_spin)
+        right_layout.addLayout(label_gap_row)
 
         self.optimize_btn = QPushButton("✨ Optimize Layout")
         self.optimize_btn.clicked.connect(self.start_optimization)
@@ -591,7 +633,7 @@ class AlbumWindow(QMainWindow):
         text_item.setDefaultTextColor(QColor(0, 0, 0))
         self.scene.addItem(text_item)
         
-        gap = 10
+        gap = self.image_gap
         
         for leaf_id, (x, y, w, h) in boxes.items():
             # Apply gap
@@ -625,6 +667,21 @@ class AlbumWindow(QMainWindow):
                     rect_item.pixmap_item.setPixmap(scaled)
                     rect_item.pixmap_item.setPos((w - gap - scaled.width()) / 2, (h - gap - scaled.height()) / 2)
             
+            if self.show_labels:
+                label_text = path.stem
+                label_item = QGraphicsTextItem(label_text, rect_item)
+                font = label_item.font()
+                font_size = max(8, int(self.image_gap * self.label_size_ratio))
+                font.setPixelSize(font_size)
+                font.setBold(self.label_bold)
+                label_item.setFont(font)
+                label_item.setDefaultTextColor(Qt.GlobalColor.black)
+                
+                # Center horizontally
+                l_w = label_item.boundingRect().width()
+                l_h = label_item.boundingRect().height()
+                label_item.setPos((w - gap - l_w) / 2, -l_h)
+
             if leaf_id in locked:
                 rect_item.is_locked = True
                 
@@ -664,6 +721,22 @@ class AlbumWindow(QMainWindow):
     def toggle_crop_state(self, img_idx):
         current = self.image_crop_states.get(img_idx, True)
         self.image_crop_states[img_idx] = not current
+        self.draw_layout()
+
+    def on_show_labels_toggled(self, checked):
+        self.show_labels = checked
+        self.draw_layout()
+
+    def on_label_bold_toggled(self, checked):
+        self.label_bold = checked
+        self.draw_layout()
+
+    def on_label_size_changed(self, value):
+        self.label_size_ratio = value / 100.0
+        self.draw_layout()
+
+    def on_gap_changed(self, value):
+        self.image_gap = value
         self.draw_layout()
 
     def crop_all(self):
@@ -804,7 +877,8 @@ class AlbumWindow(QMainWindow):
         
         title = self.title_edit.text()
         self.export_worker = ExportThread(
-            str(path), self.pages_roots, self.pages_perms, self.image_paths, title, self.image_crop_states
+            str(path), self.pages_roots, self.pages_perms, self.image_paths, title, 
+            self.image_crop_states, self.show_labels, self.image_gap, self.label_bold, self.label_size_ratio
         )
         self.export_worker.progress.connect(self.progress_bar.setValue)
         self.export_worker.finished.connect(self.on_export_finished)

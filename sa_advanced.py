@@ -179,6 +179,9 @@ def render_page(
     bg=(255, 255, 255),
     title: str = "default title",
     crop_states: Optional[Dict[int, bool]] = None,
+    show_labels: bool = False,
+    label_bold: bool = False,
+    label_size_ratio: float = 0.5,
 ) -> Image.Image:
     title_height = int(page_H * 0.1)
     inner_W = page_W - 2 * page_margin_px
@@ -209,6 +212,19 @@ def render_page(
     x = (page_W - text_width) // 2
     y = (title_height - text_height) // 2
     draw.text((x, y), title, fill=(0, 0, 0), font=font)
+
+    # Label font setup
+    label_font_size = max(8, int(gap_px * label_size_ratio))
+    font_name = "arialbd.ttf" if label_bold else "arial.ttf"
+    alt_font_name = "DejaVuSans-Bold.ttf" if label_bold else "DejaVuSans.ttf"
+    
+    try:
+        label_font = ImageFont.truetype(font_name, label_font_size)
+    except:
+        try:
+            label_font = ImageFont.truetype(alt_font_name, label_font_size)
+        except:
+            label_font = ImageFont.load_default()
     
     for leaf_id, (x, y, w, h) in placements.items():
         xi = int(round(x + inset))
@@ -230,6 +246,15 @@ def render_page(
             else:
                 tile = ImageOps.pad(im, (wi, hi), color=bg, centering=(0.5, 0.5))
             page.paste(tile, (xi, yi))
+
+            if show_labels:
+                label = images[img_id].stem
+                l_bbox = draw.textbbox((0, 0), label, font=label_font)
+                l_w = l_bbox[2] - l_bbox[0]
+                l_h = l_bbox[3] - l_bbox[1]
+                lx = xi + (wi - l_w) // 2
+                ly = yi - l_h - 2 # 2px padding from image top
+                draw.text((lx, ly), label, fill=(0, 0, 0), font=label_font)
 
     return page
 
