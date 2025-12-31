@@ -93,6 +93,52 @@ class OptimizationThread(QThread):
     def emit_progress(self, step, total):
         self.progress.emit(step, total)
 
+class ExportThread(QThread):
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(bool, str)
+    
+    def __init__(self, output_path, pages_roots, pages_perms, image_paths, title):
+        super().__init__()
+        self.output_path = output_path
+        self.pages_roots = pages_roots
+        self.pages_perms = pages_perms
+        self.image_paths = image_paths
+        self.title = title
+        self.export_W = 2480
+        self.export_H = 3508
+        
+    def run(self):
+        try:
+            pdf_pages = []
+            total = len(self.pages_roots)
+            for i, (root, perm) in enumerate(zip(self.pages_roots, self.pages_perms)):
+                if not root or not perm:
+                    continue
+                
+                page_img = sa.render_page(
+                    root=root,
+                    page_W=self.export_W,
+                    page_H=self.export_H,
+                    images=self.image_paths,
+                    perm=perm,
+                    page_margin_px=120,
+                    gap_px=40,
+                    title=self.title
+                )
+                pdf_pages.append(page_img)
+                self.progress.emit(i + 1, total)
+            
+            if pdf_pages:
+                pdf_pages[0].save(
+                    self.output_path, "PDF", resolution=300.0,
+                    save_all=True, append_images=pdf_pages[1:]
+                )
+                self.finished.emit(True, f"Successfully saved to {self.output_path}")
+            else:
+                self.finished.emit(False, "No pages to export.")
+        except Exception as e:
+            self.finished.emit(False, str(e))
+
 class LeafItem(QGraphicsRectItem):
     def __init__(self, x, y, w, h, leaf_id, parent_gui):
         super().__init__(x, y, w, h)
@@ -217,11 +263,15 @@ class AlbumWindow(QMainWindow):
         self.optimize_btn.setEnabled(False)
         self.reset_btn = QPushButton("Reset Layout")
         self.reset_btn.clicked.connect(self.reset_layout)
+        self.export_btn = QPushButton("Save as PDF")
+        self.export_btn.clicked.connect(self.export_pdf_dialog)
+        self.export_btn.setEnabled(False)
         
         self.progress_bar = QProgressBar()
         
         right_layout.addWidget(self.optimize_btn)
         right_layout.addWidget(self.reset_btn)
+        right_layout.addWidget(self.export_btn)
         right_layout.addStretch()
         right_layout.addWidget(self.progress_bar)
         
@@ -384,6 +434,7 @@ class AlbumWindow(QMainWindow):
         self.update_page_nav()
         self.draw_layout()
         self.optimize_btn.setEnabled(bool(self.pages_roots))
+        self.export_btn.setEnabled(bool(self.pages_roots))
 
     def draw_layout(self):
         self.scene.clear()
@@ -543,7 +594,31 @@ class AlbumWindow(QMainWindow):
         self.update_page_nav()
         self.draw_layout()
         self.optimize_btn.setEnabled(True)
+        self.export_btn.setEnabled(True)
         QMessageBox.information(self, "Done", "Optimization Complete!")
+
+    def export_pdf_dialog(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save Album as PDF", "", "PDF Files (*.pdf)")
+        if path:
+            self.export_btn.setEnabled(False)
+            self.optimize_btn.setEnabled(False)
+            self.progress_bar.setValue(0)
+            
+            title = self.title_edit.text()
+            self.export_worker = ExportThread(
+                path, self.pages_roots, self.pages_perms, self.image_paths, title
+            )
+            self.export_worker.progress.connect(self.progress_bar.setValue)
+            self.export_worker.finished.connect(self.on_export_finished)
+            self.export_worker.start()
+
+    def on_export_finished(self, success, message):
+        self.export_btn.setEnabled(True)
+        self.optimize_btn.setEnabled(True)
+        if success:
+            QMessageBox.information(self, "Export Success", message)
+        else:
+            QMessageBox.critical(self, "Export Failed", message)
 
     def reset_layout(self):
         for locks in self.pages_locks:
