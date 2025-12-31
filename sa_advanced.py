@@ -55,6 +55,19 @@ def internal_nodes(root: Node) -> List[Node]:
             stack.append(n.left)
     return out
 
+def leaf_ids(root: Node) -> List[int]:
+    ids: List[int] = []
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        if n.leaf_id is not None:
+            ids.append(n.leaf_id)
+        else:
+            stack.append(n.right)
+            stack.append(n.left)
+    ids.sort()
+    return ids
+
 def decode_region(root: Node, x0: int, y0: int, W: int, H: int) -> Dict[int, Tuple[int, int, int, int]]:
     out: Dict[int, Tuple[int, int, int, int]] = {}
 
@@ -80,7 +93,7 @@ def decode_region(root: Node, x0: int, y0: int, W: int, H: int) -> Dict[int, Tup
 # =============================
 def energy(root: Node, W: int, H: int, perm: List[int], prefs: List[float]) -> float:
     """
-    prefs[i] is the target aspect ratio bucket for image i on THIS page.
+    prefs[i] is the target aspect ratio bucket for image i in the global pool.
     perm[leaf_id] = image index assigned to that leaf.
     """
     boxes = decode_region(root, 0, 0, W, H)
@@ -147,8 +160,8 @@ def anneal_with_snapshots(
     root: Node,
     page_W: int,
     page_H: int,
-    images: List[Path],
-    prefs: List[float],
+    all_images: List[Path],
+    all_prefs: List[float],
     page_margin_px: int,
     gap_px: int,
     steps: int,
@@ -160,42 +173,50 @@ def anneal_with_snapshots(
 ):
     rng = random.Random(seed)
     nodes = internal_nodes(root)
-    L = len(prefs)
+    pool_size = len(all_prefs)
 
     if locked_leaves is None:
         locked_leaves = {}
 
+    leaf_id_list = leaf_ids(root)
+    leaf_count = len(leaf_id_list)
+
+    if pool_size < leaf_count:
+        raise ValueError("Not enough images to fill all leaves")
+
     # Initialize perm
     # 1. Place locked images
     # 2. Shuffle remaining images into remaining slots
-    perm = [-1] * L
+    perm = [-1] * leaf_count
     used_images = set()
 
     # Apply locks
+    valid_locked = {}
     for leaf_id, img_idx in locked_leaves.items():
-        if 0 <= leaf_id < L:
-             perm[leaf_id] = img_idx
-             used_images.add(img_idx)
+        if leaf_id in leaf_id_list and 0 <= img_idx < pool_size:
+            if img_idx in used_images:
+                continue  # prevent duplicate usage of the same image in different locked leaves
+            perm[leaf_id] = img_idx
+            used_images.add(img_idx)
+            valid_locked[leaf_id] = img_idx
 
+    locked_leaves = valid_locked
+    locked_set = set(locked_leaves.keys())
+
+    unused_images = set(range(pool_size)) - used_images
     # Fill rest
-    remaining_images = [i for i in range(L) if i not in used_images]
+    remaining_images = list(unused_images)
     rng.shuffle(remaining_images)
     
-    fill_ptr = 0
-    free_slots = []
-    for i in range(L):
-        if perm[i] == -1:
-            perm[i] = remaining_images[fill_ptr]
-            fill_ptr += 1
-            free_slots.append(i)
-        elif i not in locked_leaves:
-            # Should not happen with the logic above, but for safety:
-            # this slot was pre-filled but not locked? Only if pass non-empty perm? 
-            # This function builds perm from scratch.
-            pass
+    for leaf_id in leaf_id_list:
+        if perm[leaf_id] == -1:
+            perm[leaf_id] = remaining_images.pop()
+            used_images.add(perm[leaf_id])
+            unused_images.discard(perm[leaf_id])
             
     # We only swap indices that are NOT locked.
     # free_slots contains all leaf indices that are allowed to be swapped.
+    free_slots = [lid for lid in leaf_id_list if lid not in locked_set]
     
     inner_W = page_W - 2 * page_margin_px
     inner_H = page_H - 2 * page_margin_px
@@ -206,7 +227,7 @@ def anneal_with_snapshots(
     })
     snapshots: List[Image.Image] = []
 
-    E = energy(root, inner_W, inner_H, perm, prefs)
+    E = energy(root, inner_W, inner_H, perm, all_prefs)
     T = 1.5
 
     for step in tqdm(range(steps), desc=desc, leave=False):
@@ -215,7 +236,7 @@ def anneal_with_snapshots(
 
         if step in snapshot_steps:
             snapshots.append(render_page(
-                root, page_W, page_H, images, perm,
+                root, page_W, page_H, all_images, perm,
                 page_margin_px, gap_px
             ))
 
@@ -225,7 +246,7 @@ def anneal_with_snapshots(
             n = rng.choice(nodes)
             old = float(n.t)
             n.t = min(0.95, max(0.05, old + rng.gauss(0, 0.1 * T)))
-            E2 = energy(root, inner_W, inner_H, perm, prefs)
+            E2 = energy(root, inner_W, inner_H, perm, all_prefs)
             if E2 <= E or rng.random() < math.exp((E - E2) / max(T, 1e-9)):
                 E = E2
             else:
@@ -235,29 +256,52 @@ def anneal_with_snapshots(
             n = rng.choice(nodes)
             old = n.dir
             n.dir = "H" if old == "V" else "V"
-            E2 = energy(root, inner_W, inner_H, perm, prefs)
+            E2 = energy(root, inner_W, inner_H, perm, all_prefs)
             if E2 <= E or rng.random() < math.exp((E - E2) / max(T, 1e-9)):
                 E = E2
             else:
                 n.dir = old
 
         else:
-            # Swap two images, but only if they are in free_slots
-            # If we have 0 or 1 free slot, we can't swap effectively (or swapping with self does nothing)
-            if len(free_slots) >= 2:
-                i, j = rng.sample(free_slots, 2)
-                perm[i], perm[j] = perm[j], perm[i]
-                E2 = energy(root, inner_W, inner_H, perm, prefs)
-                if E2 <= E or rng.random() < math.exp((E - E2) / max(T, 1e-9)):
-                    E = E2
-                else:
+            # Swap two page images, or swap a page image with an unused pool image.
+            if free_slots:
+                use_pool_swap = unused_images and pool_size > leaf_count and rng.random() < 0.5
+
+                if use_pool_swap:
+                    i = rng.choice(free_slots)
+                    k = rng.choice(tuple(unused_images))
+                    old_img = perm[i]
+
+                    perm[i] = k
+                    used_images.add(k)
+                    unused_images.remove(k)
+                    used_images.discard(old_img)
+                    unused_images.add(old_img)
+
+                    E2 = energy(root, inner_W, inner_H, perm, all_prefs)
+                    if E2 <= E or rng.random() < math.exp((E - E2) / max(T, 1e-9)):
+                        E = E2
+                    else:
+                        perm[i] = old_img
+                        used_images.add(old_img)
+                        unused_images.remove(old_img)
+                        used_images.discard(k)
+                        unused_images.add(k)
+
+                elif len(free_slots) >= 2:
+                    i, j = rng.sample(free_slots, 2)
                     perm[i], perm[j] = perm[j], perm[i]
+                    E2 = energy(root, inner_W, inner_H, perm, all_prefs)
+                    if E2 <= E or rng.random() < math.exp((E - E2) / max(T, 1e-9)):
+                        E = E2
+                    else:
+                        perm[i], perm[j] = perm[j], perm[i]
 
         T *= 0.9994
 
     if (steps - 1) not in snapshot_steps:
         snapshots.append(render_page(
-            root, page_W, page_H, images, perm,
+            root, page_W, page_H, all_images, perm,
             page_margin_px, gap_px
         ))
 
@@ -354,8 +398,8 @@ def make_multi_page_storyboards_no_duplicates(
             root=root,
             page_W=page_W,
             page_H=page_H,
-            images=chunk,
-            prefs=prefs,
+            all_images=chunk,
+            all_prefs=prefs,
             page_margin_px=page_margin_px,
             gap_px=gap_px,
             steps=steps,

@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QListWidget, QListWidgetItem, 
                              QGraphicsView, QGraphicsScene, QGraphicsRectItem, 
                              QGraphicsPixmapItem, QFileDialog, QLabel, QProgressBar,
-                             QSplitter, QMessageBox, QFrame)
+                             QSplitter, QMessageBox, QFrame, QComboBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QMimeData, QPointF
 from PyQt6.QtGui import QPixmap, QDrag, QImage, QPainter, QColor, QPen, QIcon
 
@@ -18,13 +18,13 @@ class OptimizationThread(QThread):
     progress = pyqtSignal(int, int)
     finished_optim = pyqtSignal(list)
     
-    def __init__(self, root, page_W, page_H, images, prefs, locked_leaves):
+    def __init__(self, root, page_W, page_H, images, all_prefs, locked_leaves):
         super().__init__()
         self.root = root
         self.page_W = page_W
         self.page_H = page_H
         self.images = images
-        self.prefs = prefs
+        self.all_prefs = all_prefs
         self.locked_leaves = locked_leaves
         
     def run(self):
@@ -34,8 +34,8 @@ class OptimizationThread(QThread):
             root=self.root,
             page_W=self.page_W,
             page_H=self.page_H,
-            images=self.images,
-            prefs=self.prefs,
+            all_images=self.images,
+            all_prefs=self.all_prefs,
             page_margin_px=50, # Scaled down for GUI? Or full size? 
                           # Ideally we use full size logic but simple coordinates.
             gap_px=20,
@@ -92,6 +92,8 @@ class AlbumWindow(QMainWindow):
         self.root: Optional[sa.Node] = None
         self.perm: List[int] = [] # Maps leaf_id -> image_idx
         self.locked_leaves: Dict[int, int] = {} # leaf_id -> image_idx
+        self.target_leaf_count: Optional[int] = None
+        self.all_prefs: List[float] = []
         
         self.page_W = 1000  # Internal logic size
         self.page_H = 1414  # ~A4 Aspect
@@ -122,6 +124,14 @@ class AlbumWindow(QMainWindow):
         
         # Right: Controls
         right_layout = QVBoxLayout()
+        size_row = QHBoxLayout()
+        size_label = QLabel("Target slots")
+        self.slot_combo = QComboBox()
+        self.slot_combo.setEnabled(False)
+        self.slot_combo.currentIndexChanged.connect(self.on_slot_count_changed)
+        size_row.addWidget(size_label)
+        size_row.addWidget(self.slot_combo)
+
         self.optimize_btn = QPushButton("✨ Optimize Layout")
         self.optimize_btn.clicked.connect(self.start_optimization)
         self.optimize_btn.setEnabled(False)
@@ -156,6 +166,10 @@ class AlbumWindow(QMainWindow):
 
     def load_images(self, folder):
         self.image_paths = []
+        self.all_prefs = []
+        self.root = None
+        self.perm = []
+        self.locked_leaves = {}
         self.image_list.clear()
         
         folder_path = Path(folder)
@@ -163,19 +177,16 @@ class AlbumWindow(QMainWindow):
         files = sorted([p for p in folder_path.rglob("*") if p.suffix.lower() in exts])
         
         if not files:
+            self.slot_combo.clear()
+            self.slot_combo.setEnabled(False)
+            self.target_leaf_count = None
+            self.scene.clear()
+            self.optimize_btn.setEnabled(False)
             return
 
-        # For demo, limit to e.g. 16 images for one page or handle paging?
-        # Let's take first 16 or nearest power of 2 for simplicity
-        # Code supports arbitrary power of 2.
-        
-        count = len(files)
-        # Find largest power of 2 <= count for one page
-        if count == 0: return
-        # Limit to 32 max for this demo
-        count = min(count, 32)
-        k = sa.largest_power_of_two_leq(count)
-        self.image_paths = files[:k]
+        self.image_paths = files
+        self.all_prefs = [sa.pref_aspect_for(p) for p in self.image_paths]
+        self.update_slot_selector(len(self.image_paths))
         
         for idx, p in enumerate(self.image_paths):
             # Load thumbnail
@@ -188,29 +199,85 @@ class AlbumWindow(QMainWindow):
             self.image_list.addItem(item)
             
         self.init_tree()
-        self.optimize_btn.setEnabled(True)
+        self.optimize_btn.setEnabled(self.root is not None)
+
+    def update_slot_selector(self, total_images: int):
+        if total_images <= 0:
+            self.slot_combo.clear()
+            self.slot_combo.setEnabled(False)
+            self.target_leaf_count = None
+            return
+
+        options = []
+        k = 1
+        while k <= total_images:
+            options.append(k)
+            k *= 2
+
+        preferred = self.target_leaf_count if self.target_leaf_count in options else options[-1]
+
+        self.slot_combo.blockSignals(True)
+        self.slot_combo.clear()
+        for opt in options:
+            self.slot_combo.addItem(str(opt), opt)
+        self.slot_combo.setCurrentIndex(options.index(preferred))
+        self.slot_combo.blockSignals(False)
+        self.slot_combo.setEnabled(True)
+        self.target_leaf_count = preferred
+
+    def on_slot_count_changed(self, index: int):
+        if index < 0:
+            return
+        value = self.slot_combo.itemData(index)
+        if value is None:
+            return
+        count = int(value)
+        if count == self.target_leaf_count:
+            return
+        self.target_leaf_count = count
+        # Changing the slot count invalidates previous locks.
+        self.locked_leaves = {}
+        self.init_tree()
 
     def init_tree(self):
-        L = len(self.image_paths)
-        if L == 0: return
-        
+        total_images = len(self.image_paths)
+        if total_images == 0:
+            self.optimize_btn.setEnabled(False)
+            return
+
+        if (
+            self.target_leaf_count is None
+            or not sa.is_power_of_two(self.target_leaf_count)
+            or self.target_leaf_count > total_images
+        ):
+            self.target_leaf_count = sa.largest_power_of_two_leq(total_images)
+            # Sync selector to the corrected value if it exists
+            idx = self.slot_combo.findData(self.target_leaf_count)
+            if idx >= 0:
+                self.slot_combo.blockSignals(True)
+                self.slot_combo.setCurrentIndex(idx)
+                self.slot_combo.blockSignals(False)
+
+        leaf_count = self.target_leaf_count
         try:
-            self.root = sa.build_full_tree(L, seed=42)
+            self.root = sa.build_full_tree(leaf_count, seed=42)
         except AssertionError:
-             # Retry with smaller power of 2
-             pass
-             
-        # Initial perm: random
+            self.root = None
+            self.optimize_btn.setEnabled(False)
+            return
+
         import random
-        self.perm = list(range(L))
-        random.shuffle(self.perm)
+        pool_indices = list(range(total_images))
+        random.shuffle(pool_indices)
+        self.perm = pool_indices[:leaf_count]
         self.locked_leaves = {}
         
         self.draw_layout()
+        self.optimize_btn.setEnabled(self.root is not None)
 
     def draw_layout(self):
         self.scene.clear()
-        if not self.root: return
+        if not self.root or not self.perm: return
         
         margin = 20
         W, H = self.page_W, self.page_H
@@ -229,7 +296,11 @@ class AlbumWindow(QMainWindow):
             )
             rect_item.setPos(x + gap/2, y + gap/2)
             
+            if leaf_id >= len(self.perm):
+                continue
             img_idx = self.perm[leaf_id]
+            if img_idx < 0 or img_idx >= len(self.image_paths):
+                continue
             
             # Load image to display in rect
             path = self.image_paths[img_idx]
@@ -258,43 +329,48 @@ class AlbumWindow(QMainWindow):
     def handle_drop(self, leaf_id, img_idx):
         # User dropped image `img_idx` onto `leaf_id`.
         # Constraint: Image `img_idx` MUST be at `leaf_id`.
-        
-        # 1. Update locked stats
+        if not self.root or not self.perm:
+            return
+        if leaf_id < 0 or leaf_id >= len(self.perm):
+            return
+        if img_idx < 0 or img_idx >= len(self.image_paths):
+            return
+
+        # Remove any previous lock that tied this image to a different leaf.
+        for locked_leaf, locked_img in list(self.locked_leaves.items()):
+            if locked_leaf != leaf_id and locked_img == img_idx:
+                del self.locked_leaves[locked_leaf]
+
         self.locked_leaves[leaf_id] = img_idx
-        
-        # 2. Update permutation to satisfy this lock immediately
-        # Find where img_idx currently is
-        current_leaf_of_img = -1
-        for l_id, im_id in enumerate(self.perm):
-            if im_id == img_idx:
-                current_leaf_of_img = l_id
-                break
-        
-        # If it's already there, great.
-        if current_leaf_of_img != leaf_id:
-            # Swap whatever is at leaf_id with img_idx
-            # Wait, if `leaf_id` was already locked to something else? 
-            # Overwrite lock.
-            
-            # The image currently at `leaf_id`
-            old_img_at_target = self.perm[leaf_id]
-            
-            # Swap
+
+        if img_idx in self.perm:
+            current_leaf_of_img = self.perm.index(img_idx)
+            if current_leaf_of_img != leaf_id:
+                self.perm[leaf_id], self.perm[current_leaf_of_img] = (
+                    self.perm[current_leaf_of_img],
+                    self.perm[leaf_id],
+                )
+        else:
             self.perm[leaf_id] = img_idx
-            self.perm[current_leaf_of_img] = old_img_at_target
-            
-        # Re-draw
+
         self.draw_layout()
 
     def start_optimization(self):
-        L = len(self.image_paths)
-        if L == 0: return
-        
-        prefs = [sa.pref_aspect_for(p) for p in self.image_paths]
-        
+        if not self.root or not self.perm:
+            return
+
+        if not self.all_prefs or len(self.all_prefs) != len(self.image_paths):
+            self.all_prefs = [sa.pref_aspect_for(p) for p in self.image_paths]
+
+        locked = {
+            leaf_id: img_idx
+            for leaf_id, img_idx in self.locked_leaves.items()
+            if 0 <= leaf_id < len(self.perm)
+        }
+
         self.worker = OptimizationThread(
             self.root, self.page_W, self.page_H,
-            self.image_paths, prefs, self.locked_leaves
+            self.image_paths, self.all_prefs, locked
         )
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.finished_optim.connect(self.on_optim_finished)
