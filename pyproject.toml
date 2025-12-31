@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "album"
+version = "0.0.0"
+description = "Esthetic Album Designer"
+requires-python = ">=3.10"
+dependencies = [
+  "PyQt6",
+  "Pillow",
+  "tqdm",
+]
+
