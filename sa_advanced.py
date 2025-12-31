@@ -1,9 +1,50 @@
 import random, math
+import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Tuple, List
 from PIL import Image, ImageOps
 from tqdm import tqdm
+
+# =============================
+# Image Metadata Caching
+# =============================
+@dataclass
+class ImageMetadata:
+    path: Path
+    width: int
+    height: int
+    aspect_ratio: float
+    pref_aspect: float
+
+_metadata_cache: Dict[Path, ImageMetadata] = {}
+
+def batch_process_images(paths: List[Path]) -> List[ImageMetadata]:
+    results = []
+    for p in tqdm(paths, desc="Processing Images"):
+        if p in _metadata_cache:
+            results.append(_metadata_cache[p])
+            continue
+        try:
+            with Image.open(p) as im:
+                w, h = im.size
+            r = w / h if h else 1.0
+            
+            if 0.85 <= r <= 1.15:
+                pref = 1.0
+            elif r > 1.7:
+                pref = 2.0
+            elif r > 1.15:
+                pref = 1.5
+            else:
+                pref = 2/3
+                
+            meta = ImageMetadata(p, w, h, r, pref)
+            _metadata_cache[p] = meta
+            results.append(meta)
+        except Exception as e:
+            print(f"Error processing {p}: {e}")
+    return results
 
 # =============================
 # Guillotine slicing tree
@@ -91,27 +132,38 @@ def decode_region(root: Node, x0: int, y0: int, W: int, H: int) -> Dict[int, Tup
 # =============================
 # Energy
 # =============================
-def energy(root: Node, W: int, H: int, perm: List[int], prefs: List[float]) -> float:
+def energy(root: Node, W: int, H: int, perm: List[int], prefs: np.ndarray) -> float:
     """
-    prefs[i] is the target aspect ratio bucket for image i in the global pool.
+    prefs is a np.ndarray of target aspect ratios.
     perm[leaf_id] = image index assigned to that leaf.
     """
     boxes = decode_region(root, 0, 0, W, H)
-    target_area = (W * H) / len(boxes)
+    num_boxes = len(boxes)
+    target_area = (W * H) / num_boxes
 
-    e = 0.0
-    for leaf_id, (_, _, w, h) in boxes.items():
-        rho = w / h if h else 1.0
-        a = prefs[perm[leaf_id]]
-        e += (math.log(rho / a) ** 2)
-        e += ((w * h - target_area) / target_area) ** 2
+    # Vectorized part
+    leaf_ids_list = sorted(boxes.keys())
+    w_h = np.array([boxes[lid][2:4] for lid in leaf_ids_list]) # (num_boxes, 2)
+    w = w_h[:, 0]
+    h = w_h[:, 1]
+    
+    img_indices = np.array([perm[lid] for lid in leaf_ids_list])
+    current_prefs = prefs[img_indices]
+    
+    rho = w / np.where(h == 0, 1.0, h)
+    
+    # Energy components
+    e_aspect = np.sum(np.log(rho / current_prefs) ** 2)
+    e_area = np.sum(((w * h - target_area) / target_area) ** 2)
+    
+    e = e_aspect + e_area
 
     # regularize extreme splits (mildly)
     for n in internal_nodes(root):
         t = min(max(float(n.t), 1e-6), 1 - 1e-6)
         e += 0.02 * (math.log(t / (1 - t)) ** 2)
 
-    return e
+    return float(e)
 
 # =============================
 # Rendering (final shrinking = gaps + page margin)
@@ -125,18 +177,55 @@ def render_page(
     page_margin_px: int,
     gap_px: int,
     bg=(255, 255, 255),
+    title: str = "default title",
+    crop_states: Optional[Dict[int, bool]] = None,
+    show_labels: bool = False,
+    label_bold: bool = False,
+    label_size_ratio: float = 0.5,
 ) -> Image.Image:
+    title_height = int(page_H * 0.1)
     inner_W = page_W - 2 * page_margin_px
-    inner_H = page_H - 2 * page_margin_px
+    inner_H = page_H - 2 * page_margin_px - title_height
     if inner_W <= 0 or inner_H <= 0:
         raise ValueError("page_margin_px too large for the page size")
 
-    placements = decode_region(root, page_margin_px, page_margin_px, inner_W, inner_H)
+    placements = decode_region(root, page_margin_px, page_margin_px + title_height, inner_W, inner_H)
 
     # shrink each tile by half-gap on each side
     inset = gap_px / 2.0
 
     page = Image.new("RGB", (page_W, page_H), bg)
+    
+    # Draw title
+    from PIL import ImageDraw, ImageFont
+    draw = ImageDraw.Draw(page)
+    try:
+        font = ImageFont.truetype("arial.ttf", int(title_height * 0.4))
+    except:
+        try:
+            font = ImageFont.truetype("DejaVuSans.ttf", int(title_height * 0.4))
+        except:
+            font = ImageFont.load_default()
+    bbox = draw.textbbox((0, 0), title, font=font)
+    text_width = bbox[2] - bbox[0]
+    text_height = bbox[3] - bbox[1]
+    x = (page_W - text_width) // 2
+    y = (title_height - text_height) // 2
+    draw.text((x, y), title, fill=(0, 0, 0), font=font)
+
+    # Label font setup
+    label_font_size = max(8, int(gap_px * label_size_ratio))
+    font_name = "arialbd.ttf" if label_bold else "arial.ttf"
+    alt_font_name = "DejaVuSans-Bold.ttf" if label_bold else "DejaVuSans.ttf"
+    
+    try:
+        label_font = ImageFont.truetype(font_name, label_font_size)
+    except:
+        try:
+            label_font = ImageFont.truetype(alt_font_name, label_font_size)
+        except:
+            label_font = ImageFont.load_default()
+    
     for leaf_id, (x, y, w, h) in placements.items():
         xi = int(round(x + inset))
         yi = int(round(y + inset))
@@ -147,204 +236,410 @@ def render_page(
 
         img_id = perm[leaf_id]
         with Image.open(images[img_id]) as im:
-            im = ImageOps.exif_transpose(im).convert("RGB")
-            tile = ImageOps.fit(im, (wi, hi), method=Image.Resampling.LANCZOS)
+            im = im.convert("RGB")
+            should_crop = True
+            if crop_states is not None:
+                should_crop = crop_states.get(img_id, True)
+                
+            if should_crop:
+                tile = ImageOps.fit(im, (wi, hi), method=Image.Resampling.LANCZOS)
+            else:
+                tile = ImageOps.pad(im, (wi, hi), color=bg, centering=(0.5, 0.5))
             page.paste(tile, (xi, yi))
+
+            if show_labels:
+                label = images[img_id].stem
+                l_bbox = draw.textbbox((0, 0), label, font=label_font)
+                l_w = l_bbox[2] - l_bbox[0]
+                l_h = l_bbox[3] - l_bbox[1]
+                lx = xi + (wi - l_w) // 2
+                ly = yi - l_h - 2 # 2px padding from image top
+                draw.text((lx, ly), label, fill=(0, 0, 0), font=label_font)
 
     return page
 
-# =============================
-# SA with tqdm + snapshots only
-# =============================
-def anneal_with_snapshots(
-    root: Node,
-    page_W: int,
-    page_H: int,
-    all_images: List[Path],
-    all_prefs: List[float],
-    page_margin_px: int,
-    gap_px: int,
-    steps: int,
-    snapshots_count: int,
-    seed: int,
-    desc: str,
-    locked_leaves: Optional[Dict[int, int]] = None,  # leaf_id -> image_idx
-    progress_callback: Optional[callable] = None,    # fn(step, total_steps)
-):
-    rng = random.Random(seed)
-    nodes = internal_nodes(root)
-    pool_size = len(all_prefs)
-
-    if locked_leaves is None:
-        locked_leaves = {}
-
-    leaf_id_list = leaf_ids(root)
-    leaf_count = len(leaf_id_list)
-
-    if pool_size < leaf_count:
-        raise ValueError("Not enough images to fill all leaves")
-
-    # Initialize perm
-    # 1. Place locked images
-    # 2. Shuffle remaining images into remaining slots
-    perm = [-1] * leaf_count
-    used_images = set()
-
-    # Apply locks
-    valid_locked = {}
-    for leaf_id, img_idx in locked_leaves.items():
-        if leaf_id in leaf_id_list and 0 <= img_idx < pool_size:
-            if img_idx in used_images:
-                continue  # prevent duplicate usage of the same image in different locked leaves
-            perm[leaf_id] = img_idx
-            used_images.add(img_idx)
-            valid_locked[leaf_id] = img_idx
-
-    locked_leaves = valid_locked
-    locked_set = set(locked_leaves.keys())
-
-    unused_images = set(range(pool_size)) - used_images
-    # Fill rest
-    remaining_images = list(unused_images)
-    rng.shuffle(remaining_images)
+def anneal_global(
+    roots: List[Node],
+    page_W: int, page_H: int,
+    all_images: List[Path], all_prefs: List[float],
+    initial_perms: List[List[int]], # Global indices
+    swap_pool: List[int],           # Global indices
+    locked_leaves: List[Dict[int, int]], # List of leaf_id -> global_img_idx
+    steps: int = 10000,
+    progress_callback: Optional[callable] = None,
+    title: str = "default title"
+) -> Tuple[List[List[int]], List[int], List[float]]:
+    rng = random.Random(42)
+    num_pages = len(roots)
+    perms = [p[:] for p in initial_perms]
+    pool = swap_pool[:]
+    prefs_arr = np.array(all_prefs)
     
-    for leaf_id in leaf_id_list:
-        if perm[leaf_id] == -1:
-            perm[leaf_id] = remaining_images.pop()
-            used_images.add(perm[leaf_id])
-            unused_images.discard(perm[leaf_id])
-            
-    # We only swap indices that are NOT locked.
-    # free_slots contains all leaf indices that are allowed to be swapped.
-    free_slots = [lid for lid in leaf_id_list if lid not in locked_set]
+    # Pre-calculate internal nodes and leaf IDs for each page
+    pages_internal = [internal_nodes(r) for r in roots]
+    pages_leaf_ids = [leaf_ids(r) for r in roots]
     
+    # Pre-calculate free slots for each page (respecting locks)
+    pages_free_slots = []
+    for p in range(num_pages):
+        locked_set = set(locked_leaves[p].keys())
+        pages_free_slots.append([lid for lid in pages_leaf_ids[p] if lid not in locked_set])
+
+    # Inner dimensions for energy calculation
+    page_margin_px = 50 
     inner_W = page_W - 2 * page_margin_px
-    inner_H = page_H - 2 * page_margin_px
+    title_height = int(page_H * 0.1)
+    inner_H = page_H - 2 * page_margin_px - title_height
 
-    snapshot_steps = sorted({
-        int(i * (steps - 1) / max(1, snapshots_count - 1))
-        for i in range(snapshots_count)
-    })
-    snapshots: List[Image.Image] = []
-
-    E = energy(root, inner_W, inner_H, perm, all_prefs)
+    # Track individual page energies
+    page_energies = [energy(roots[p], inner_W, inner_H, perms[p], prefs_arr) for p in range(num_pages)]
+    E = sum(page_energies)
     T = 1.5
+    energy_history = []
 
-    for step in tqdm(range(steps), desc=desc, leave=False):
+    for step in tqdm(range(steps), desc="Global Annealing", leave=False):
+        energy_history.append(E)
         if progress_callback:
             progress_callback(step, steps)
 
-        if step in snapshot_steps:
-            snapshots.append(render_page(
-                root, page_W, page_H, all_images, perm,
-                page_margin_px, gap_px
-            ))
-
-        move = rng.random()
-
-        if move < 0.60:
-            n = rng.choice(nodes)
-            old = float(n.t)
-            n.t = min(0.95, max(0.05, old + rng.gauss(0, 0.1 * T)))
-            E2 = energy(root, inner_W, inner_H, perm, all_prefs)
+        move_type = rng.random()
+        
+        if move_type < 0.5:
+            # Structure Move (50%)
+            p_idx = rng.randrange(num_pages)
+            if not pages_internal[p_idx]: continue
+            n = rng.choice(pages_internal[p_idx])
+            
+            old_t = n.t
+            old_dir = n.dir
+            
+            if rng.random() < 0.5:
+                n.t = min(0.95, max(0.05, old_t + rng.gauss(0, 0.1 * T)))
+            else:
+                n.dir = "H" if old_dir == "V" else "V"
+            
+            new_page_E = energy(roots[p_idx], inner_W, inner_H, perms[p_idx], prefs_arr)
+            E2 = E - page_energies[p_idx] + new_page_E
+            
             if E2 <= E or rng.random() < math.exp((E - E2) / max(T, 1e-9)):
                 E = E2
+                page_energies[p_idx] = new_page_E
             else:
-                n.t = old
-
-        elif move < 0.80:
-            n = rng.choice(nodes)
-            old = n.dir
-            n.dir = "H" if old == "V" else "V"
-            E2 = energy(root, inner_W, inner_H, perm, all_prefs)
-            if E2 <= E or rng.random() < math.exp((E - E2) / max(T, 1e-9)):
-                E = E2
-            else:
-                n.dir = old
-
+                n.t = old_t
+                n.dir = old_dir
         else:
-            # Swap two page images, or swap a page image with an unused pool image.
-            if free_slots:
-                use_pool_swap = unused_images and pool_size > leaf_count and rng.random() < 0.5
-
-                if use_pool_swap:
-                    i = rng.choice(free_slots)
-                    k = rng.choice(tuple(unused_images))
-                    old_img = perm[i]
-
-                    perm[i] = k
-                    used_images.add(k)
-                    unused_images.remove(k)
-                    used_images.discard(old_img)
-                    unused_images.add(old_img)
-
-                    E2 = energy(root, inner_W, inner_H, perm, all_prefs)
+            # Swap Move (50%)
+            swap_subcase = rng.random()
+            if swap_subcase < 0.33:
+                # Sub-case A: Intra-Page
+                p_idx = rng.randrange(num_pages)
+                free = pages_free_slots[p_idx]
+                if len(free) >= 2:
+                    i, j = rng.sample(free, 2)
+                    perms[p_idx][i], perms[p_idx][j] = perms[p_idx][j], perms[p_idx][i]
+                    
+                    new_page_E = energy(roots[p_idx], inner_W, inner_H, perms[p_idx], prefs_arr)
+                    E2 = E - page_energies[p_idx] + new_page_E
+                    
                     if E2 <= E or rng.random() < math.exp((E - E2) / max(T, 1e-9)):
                         E = E2
+                        page_energies[p_idx] = new_page_E
                     else:
-                        perm[i] = old_img
-                        used_images.add(old_img)
-                        unused_images.remove(old_img)
-                        used_images.discard(k)
-                        unused_images.add(k)
-
-                elif len(free_slots) >= 2:
-                    i, j = rng.sample(free_slots, 2)
-                    perm[i], perm[j] = perm[j], perm[i]
-                    E2 = energy(root, inner_W, inner_H, perm, all_prefs)
-                    if E2 <= E or rng.random() < math.exp((E - E2) / max(T, 1e-9)):
-                        E = E2
-                    else:
-                        perm[i], perm[j] = perm[j], perm[i]
-
+                        perms[p_idx][i], perms[p_idx][j] = perms[p_idx][j], perms[p_idx][i]
+            elif swap_subcase < 0.66:
+                # Sub-case B: Inter-Page
+                if num_pages >= 2:
+                    p1, p2 = rng.sample(range(num_pages), 2)
+                    free1 = pages_free_slots[p1]
+                    free2 = pages_free_slots[p2]
+                    if free1 and free2:
+                        i = rng.choice(free1)
+                        j = rng.choice(free2)
+                        perms[p1][i], perms[p2][j] = perms[p2][j], perms[p1][i]
+                        
+                        new_E1 = energy(roots[p1], inner_W, inner_H, perms[p1], prefs_arr)
+                        new_E2 = energy(roots[p2], inner_W, inner_H, perms[p2], prefs_arr)
+                        E2 = E - page_energies[p1] - page_energies[p2] + new_E1 + new_E2
+                        
+                        if E2 <= E or rng.random() < math.exp((E - E2) / max(T, 1e-9)):
+                            E = E2
+                            page_energies[p1] = new_E1
+                            page_energies[p2] = new_E2
+                        else:
+                            perms[p1][i], perms[p2][j] = perms[p2][j], perms[p1][i]
+            else:
+                # Sub-case C: Pool Swap
+                if pool:
+                    p_idx = rng.randrange(num_pages)
+                    free = pages_free_slots[p_idx]
+                    if free:
+                        i = rng.choice(free)
+                        k_idx = rng.randrange(len(pool))
+                        perms[p_idx][i], pool[k_idx] = pool[k_idx], perms[p_idx][i]
+                        
+                        new_page_E = energy(roots[p_idx], inner_W, inner_H, perms[p_idx], prefs_arr)
+                        E2 = E - page_energies[p_idx] + new_page_E
+                        
+                        if E2 <= E or rng.random() < math.exp((E - E2) / max(T, 1e-9)):
+                            E = E2
+                            page_energies[p_idx] = new_page_E
+                        else:
+                            perms[p_idx][i], pool[k_idx] = pool[k_idx], perms[p_idx][i]
+        
         T *= 0.9994
+        
+    return perms, pool, energy_history
 
-    if (steps - 1) not in snapshot_steps:
-        snapshots.append(render_page(
-            root, page_W, page_H, all_images, perm,
-            page_margin_px, gap_px
-        ))
-
-    return perm, snapshots
-
-# =============================
-# Storyboard (snapshots only)
-# =============================
-def compose_storyboard(snapshots: List[Image.Image], pad: int = 24, bg=(255, 255, 255)) -> Image.Image:
-    W = sum(im.width for im in snapshots) + pad * (len(snapshots) + 1)
-    H = max(im.height for im in snapshots) + pad * 2
-    canvas = Image.new("RGB", (W, H), bg)
-    x = pad
-    for im in snapshots:
-        canvas.paste(im, (x, pad))
-        x += im.width + pad
-    return canvas
-
-# =============================
-# Paging without duplicates:
-# Use full pages of max_leaves (power of 2),
-# then for the tail use decreasing powers of 2 (no repeats)
-# =============================
-def split_into_pages_no_duplicates(paths: List[Path], max_leaves: int) -> List[List[Path]]:
+def optimize_es(
+    roots: List[Node],
+    page_W: int, page_H: int,
+    all_images: List[Path], all_prefs: List[float],
+    initial_perms: List[List[int]],
+    swap_pool: List[int],
+    locked_leaves: List[Dict[int, int]],
+    steps: int = 10000,
+    progress_callback: Optional[callable] = None,
+    title: str = "default title"
+) -> Tuple[List[List[int]], List[int], List[float]]:
     """
-    Returns a list of pages, each page length is a power of 2 <= max_leaves.
-    Covers all images exactly once. No duplicates.
+    (1+1)-Evolutionary Strategy for global layout optimization.
     """
-    assert is_power_of_two(max_leaves), "max_leaves must be a power of 2"
-    pages: List[List[Path]] = []
-    i = 0
-    n = len(paths)
-    while i < n:
-        remaining = n - i
-        k = max_leaves if remaining >= max_leaves else largest_power_of_two_leq(remaining)
-        pages.append(paths[i:i + k])
-        i += k
-    return pages
+    rng = random.Random(42)
+    num_pages = len(roots)
+    perms = [p[:] for p in initial_perms]
+    pool = swap_pool[:]
+    prefs_arr = np.array(all_prefs)
+    
+    pages_internal = [internal_nodes(r) for r in roots]
+    pages_leaf_ids = [leaf_ids(r) for r in roots]
+    pages_free_slots = []
+    for p in range(num_pages):
+        locked_set = set(locked_leaves[p].keys())
+        pages_free_slots.append([lid for lid in pages_leaf_ids[p] if lid not in locked_set])
+
+    page_margin_px = 50 
+    inner_W = page_W - 2 * page_margin_px
+    title_height = int(page_H * 0.1)
+    inner_H = page_H - 2 * page_margin_px - title_height
+
+    page_energies = [energy(roots[p], inner_W, inner_H, perms[p], prefs_arr) for p in range(num_pages)]
+    E = sum(page_energies)
+    
+    sigma = 0.1
+    energy_history = []
+    
+    success_window = []
+    window_size = 50
+
+    for step in tqdm(range(steps), desc="Evolutionary Strategy", leave=False):
+        energy_history.append(E)
+        if progress_callback:
+            progress_callback(step, steps)
+
+        p_idx = rng.randrange(num_pages)
+        mutation_accepted = False
+        
+        move_type = rng.random()
+        
+        if move_type < 0.9: # 90% Gaussian mutation on t
+            if pages_internal[p_idx]:
+                n = rng.choice(pages_internal[p_idx])
+                old_t = n.t
+                n.t = min(0.95, max(0.05, old_t + rng.gauss(0, sigma)))
+                
+                new_page_E = energy(roots[p_idx], inner_W, inner_H, perms[p_idx], prefs_arr)
+                E2 = E - page_energies[p_idx] + new_page_E
+                
+                if E2 < E:
+                    E = E2
+                    page_energies[p_idx] = new_page_E
+                    mutation_accepted = True
+                else:
+                    n.t = old_t
+        else: # 10% Discrete mutation (Flip or Swap)
+            sub_move = rng.random()
+            if sub_move < 0.33: # Flip H/V
+                if pages_internal[p_idx]:
+                    n = rng.choice(pages_internal[p_idx])
+                    old_dir = n.dir
+                    n.dir = "H" if old_dir == "V" else "V"
+                    
+                    new_page_E = energy(roots[p_idx], inner_W, inner_H, perms[p_idx], prefs_arr)
+                    E2 = E - page_energies[p_idx] + new_page_E
+                    
+                    if E2 < E:
+                        E = E2
+                        page_energies[p_idx] = new_page_E
+                        mutation_accepted = True
+                    else:
+                        n.dir = old_dir
+            elif sub_move < 0.66: # Intra-page swap
+                free = pages_free_slots[p_idx]
+                if len(free) >= 2:
+                    i, j = rng.sample(free, 2)
+                    perms[p_idx][i], perms[p_idx][j] = perms[p_idx][j], perms[p_idx][i]
+                    
+                    new_page_E = energy(roots[p_idx], inner_W, inner_H, perms[p_idx], prefs_arr)
+                    E2 = E - page_energies[p_idx] + new_page_E
+                    
+                    if E2 < E:
+                        E = E2
+                        page_energies[p_idx] = new_page_E
+                        mutation_accepted = True
+                    else:
+                        perms[p_idx][i], perms[p_idx][j] = perms[p_idx][j], perms[p_idx][i]
+            else: # Pool swap
+                if pool:
+                    free = pages_free_slots[p_idx]
+                    if free:
+                        i = rng.choice(free)
+                        k_idx = rng.randrange(len(pool))
+                        perms[p_idx][i], pool[k_idx] = pool[k_idx], perms[p_idx][i]
+                        
+                        new_page_E = energy(roots[p_idx], inner_W, inner_H, perms[p_idx], prefs_arr)
+                        E2 = E - page_energies[p_idx] + new_page_E
+                        
+                        if E2 < E:
+                            E = E2
+                            page_energies[p_idx] = new_page_E
+                            mutation_accepted = True
+                        else:
+                            perms[p_idx][i], pool[k_idx] = pool[k_idx], perms[p_idx][i]
+
+        success_window.append(mutation_accepted)
+        if len(success_window) >= window_size:
+            success_rate = sum(success_window) / window_size
+            if success_rate > 0.2:
+                sigma *= 1.2
+            else:
+                sigma *= 0.85
+            success_window = []
+
+    return perms, pool, energy_history
+
+def optimize_linear_partition(
+    roots: List[Node],
+    page_W: int, page_H: int,
+    all_images: List[Path], all_prefs: List[float],
+    initial_perms: List[List[int]],
+    swap_pool: List[int],
+    locked_leaves: List[Dict[int, int]],
+    steps: int = 1,
+    progress_callback: Optional[callable] = None,
+    title: str = "default title"
+) -> Tuple[List[Node], List[List[int]], List[int], List[float]]:
+    """
+    Deterministic Linear Partitioning (Justified Layout) algorithm.
+    Arranges images in sequential order into rows, minimizing cropping.
+    """
+    num_pages = len(roots)
+    new_roots = []
+    perms = [p[:] for p in initial_perms]
+    pool = swap_pool[:]
+    
+    page_margin_px = 50 
+    title_height = int(page_H * 0.1)
+    inner_W = page_W - 2 * page_margin_px
+    inner_H = page_H - 2 * page_margin_px - title_height
+
+    for p_idx in range(num_pages):
+        perm = perms[p_idx]
+        if not perm:
+            new_roots.append(roots[p_idx])
+            continue
+            
+        prefs = [all_prefs[idx] for idx in perm]
+        num_images = len(perm)
+        
+        # Target row height: heuristic to have ~3 images per row
+        target_h = inner_H / math.sqrt(num_images) if num_images > 0 else inner_H
+        
+        # DP for optimal row breaks
+        # dp[i] = min cost to partition first i images
+        dp = [float('inf')] * (num_images + 1)
+        dp[0] = 0
+        breaks = [0] * (num_images + 1)
+        
+        for i in range(1, num_images + 1):
+            # Iterate backwards to find the best previous break
+            # Limit images per row to 5 for better aesthetics
+            for j in range(max(0, i - 5), i):
+                row_prefs = prefs[j:i]
+                row_width = sum(r * target_h for r in row_prefs)
+                # Cost is squared difference from inner_W
+                cost = dp[j] + (row_width - inner_W)**2
+                if cost < dp[i]:
+                    dp[i] = cost
+                    breaks[i] = j
+        
+        # Reconstruct rows
+        rows_indices = []
+        curr = num_images
+        while curr > 0:
+            prev = breaks[curr]
+            rows_indices.append(list(range(prev, curr)))
+            curr = prev
+        rows_indices.reverse()
+        
+        # Build Tree from rows
+        def build_row_tree(indices):
+            if len(indices) == 1:
+                return Node(leaf_id=indices[0])
+            
+            mid = len(indices) // 2
+            left_indices = indices[:mid]
+            right_indices = indices[mid:]
+            
+            left_sum = sum(prefs[idx] for idx in left_indices)
+            right_sum = sum(prefs[idx] for idx in right_indices)
+            t = left_sum / (left_sum + right_sum) if (left_sum + right_sum) > 0 else 0.5
+            
+            return Node(
+                dir="V",
+                t=t,
+                left=build_row_tree(left_indices),
+                right=build_row_tree(right_indices)
+            )
+
+        def build_page_tree(row_list):
+            if len(row_list) == 1:
+                return build_row_tree(row_list[0])
+            
+            mid = len(row_list) // 2
+            left_rows = row_list[:mid]
+            right_rows = row_list[mid:]
+            
+            def get_rows_height_sum(r_list):
+                h_sum = 0
+                for r in r_list:
+                    s = sum(prefs[idx] for idx in r)
+                    h_sum += inner_W / s if s > 0 else target_h
+                return h_sum
+            
+            h_left = get_rows_height_sum(left_rows)
+            h_right = get_rows_height_sum(right_rows)
+            t = h_left / (h_left + h_right) if (h_left + h_right) > 0 else 0.5
+            
+            return Node(
+                dir="H",
+                t=t,
+                left=build_page_tree(left_rows),
+                right=build_page_tree(right_rows)
+            )
+            
+        new_roots.append(build_page_tree(rows_indices))
+        
+    if progress_callback:
+        progress_callback(100, 100)
+        
+    return new_roots, perms, pool, [0.0]
 
 # =============================
 # Aspect preference bucketing (replace if you have explicit m formats)
 # =============================
 def pref_aspect_for(path: Path) -> float:
+    if path in _metadata_cache:
+        return _metadata_cache[path].pref_aspect
     with Image.open(path) as im:
         w, h = im.size
     r = w / h if h else 1.0
@@ -355,97 +650,3 @@ def pref_aspect_for(path: Path) -> float:
     if r > 1.15:
         return 1.5
     return 2/3
-
-# =============================
-# Multi-page driver
-# =============================
-def make_multi_page_storyboards_no_duplicates(
-    input_dir: str,
-    output_dir: str,
-    max_leaves_per_page: int = 16,                 # power of 2
-    page_size_px: Tuple[int, int] = (2480, 3508),  # A4 portrait @ 300dpi
-    page_margin_px: int = 120,
-    gap_px: int = 40,
-    steps: int = 15000,
-    snapshots_count: int = 6,
-    seed: int = 42,
-):
-    if not is_power_of_two(max_leaves_per_page):
-        raise ValueError("max_leaves_per_page must be a power of 2 (8, 16, 32, ...)")
-
-    input_dir = Path(input_dir)
-    out_dir = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
-    all_imgs = [p for p in input_dir.rglob("*") if p.suffix.lower() in exts]
-    all_imgs.sort()  # chronological if filenames encode time/order
-    if not all_imgs:
-        raise ValueError(f"No images found in: {input_dir}")
-
-    pages = split_into_pages_no_duplicates(all_imgs, max_leaves_per_page)
-
-    page_W, page_H = page_size_px
-    outputs = []
-
-    for page_idx, chunk in enumerate(tqdm(pages, desc="Pages"), start=1):
-        L = len(chunk)  # power of 2 by construction
-        prefs = [pref_aspect_for(p) for p in chunk]
-
-        root = build_full_tree(L, seed=seed + page_idx)
-
-        perm, snaps = anneal_with_snapshots(
-            root=root,
-            page_W=page_W,
-            page_H=page_H,
-            all_images=chunk,
-            all_prefs=prefs,
-            page_margin_px=page_margin_px,
-            gap_px=gap_px,
-            steps=steps,
-            snapshots_count=snapshots_count,
-            seed=seed + 1000 + page_idx,
-            desc=f"Annealing p{page_idx:03d} (L={L})",
-        )
-
-        storyboard = compose_storyboard(snaps, pad=24)
-        storyboard_path = out_dir / f"page_{page_idx:03d}_storyboard.png"
-        storyboard.save(storyboard_path)
-
-        final_page = render_page(
-            root=root,
-            page_W=page_W,
-            page_H=page_H,
-            images=chunk,
-            perm=perm,
-            page_margin_px=page_margin_px,
-            gap_px=gap_px,
-        )
-        final_path = out_dir / f"page_{page_idx:03d}_final.png"
-        final_page.save(final_path)
-
-        outputs.append((storyboard_path, final_path, L))
-
-    return outputs
-
-if __name__ == "__main__":
-    # Put your photos into ./photos
-    # Output:
-    #  - page_XXX_storyboard.png (snapshots only)
-    #  - page_XXX_final.png      (final layout)
-    #
-    # No duplicates: the tail is split into smaller power-of-two pages.
-    outputs = make_multi_page_storyboards_no_duplicates(
-        input_dir="/home/sreboul/Workspace/nothing/Test photos/2024-06-08",
-        output_dir="album_portrait_storyboards",
-        max_leaves_per_page=16,
-        page_size_px=(2480, 3508),  # A4 portrait @ 300 DPI
-        page_margin_px=120,
-        gap_px=40,
-        steps=15000,
-        snapshots_count=6,
-        seed=42,
-    )
-
-    for storyboard_path, final_path, L in outputs:
-        print(f"L={L}  storyboard={storyboard_path}  final={final_path}")

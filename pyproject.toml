@@ -11,6 +11,8 @@ dependencies = [
   "PyQt6",
   "Pillow",
   "tqdm",
+  "matplotlib",
+  "numpy",
 ]
 
 [tool.setuptools]
