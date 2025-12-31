@@ -125,18 +125,38 @@ def render_page(
     page_margin_px: int,
     gap_px: int,
     bg=(255, 255, 255),
+    title: str = "default title",
 ) -> Image.Image:
+    title_height = int(page_H * 0.1)
     inner_W = page_W - 2 * page_margin_px
-    inner_H = page_H - 2 * page_margin_px
+    inner_H = page_H - 2 * page_margin_px - title_height
     if inner_W <= 0 or inner_H <= 0:
         raise ValueError("page_margin_px too large for the page size")
 
-    placements = decode_region(root, page_margin_px, page_margin_px, inner_W, inner_H)
+    placements = decode_region(root, page_margin_px, page_margin_px + title_height, inner_W, inner_H)
 
     # shrink each tile by half-gap on each side
     inset = gap_px / 2.0
 
     page = Image.new("RGB", (page_W, page_H), bg)
+    
+    # Draw title
+    from PIL import ImageDraw, ImageFont
+    draw = ImageDraw.Draw(page)
+    try:
+        font = ImageFont.truetype("arial.ttf", int(title_height * 0.4))
+    except:
+        try:
+            font = ImageFont.truetype("DejaVuSans.ttf", int(title_height * 0.4))
+        except:
+            font = ImageFont.load_default()
+    bbox = draw.textbbox((0, 0), title, font=font)
+    text_width = bbox[2] - bbox[0]
+    text_height = bbox[3] - bbox[1]
+    x = (page_W - text_width) // 2
+    y = (title_height - text_height) // 2
+    draw.text((x, y), title, fill=(0, 0, 0), font=font)
+    
     for leaf_id, (x, y, w, h) in placements.items():
         xi = int(round(x + inset))
         yi = int(round(y + inset))
@@ -170,6 +190,7 @@ def anneal_with_snapshots(
     desc: str,
     locked_leaves: Optional[Dict[int, int]] = None,  # leaf_id -> image_idx
     progress_callback: Optional[callable] = None,    # fn(step, total_steps)
+    title: str = "default title",
 ):
     rng = random.Random(seed)
     nodes = internal_nodes(root)
@@ -219,7 +240,8 @@ def anneal_with_snapshots(
     free_slots = [lid for lid in leaf_id_list if lid not in locked_set]
     
     inner_W = page_W - 2 * page_margin_px
-    inner_H = page_H - 2 * page_margin_px
+    title_height = int(page_H * 0.1)
+    inner_H = page_H - 2 * page_margin_px - title_height
 
     snapshot_steps = sorted({
         int(i * (steps - 1) / max(1, snapshots_count - 1))
@@ -237,7 +259,7 @@ def anneal_with_snapshots(
         if step in snapshot_steps:
             snapshots.append(render_page(
                 root, page_W, page_H, all_images, perm,
-                page_margin_px, gap_px
+                page_margin_px, gap_px, title=title
             ))
 
         move = rng.random()
@@ -302,10 +324,142 @@ def anneal_with_snapshots(
     if (steps - 1) not in snapshot_steps:
         snapshots.append(render_page(
             root, page_W, page_H, all_images, perm,
-            page_margin_px, gap_px
+            page_margin_px, gap_px, title=title
         ))
 
     return perm, snapshots
+
+# =============================
+# Global Multi-Page Annealing
+# =============================
+def anneal_global(
+    roots: List[Node],
+    page_W: int, page_H: int,
+    all_images: List[Path], all_prefs: List[float],
+    initial_perms: List[List[int]], # Global indices
+    swap_pool: List[int],           # Global indices
+    locked_leaves: List[Dict[int, int]], # List of leaf_id -> global_img_idx
+    steps: int = 10000,
+    progress_callback: Optional[callable] = None,
+    title: str = "default title"
+) -> Tuple[List[List[int]], List[int]]:
+    rng = random.Random(42)
+    num_pages = len(roots)
+    perms = [p[:] for p in initial_perms]
+    pool = swap_pool[:]
+    
+    # Pre-calculate internal nodes and leaf IDs for each page
+    pages_internal = [internal_nodes(r) for r in roots]
+    pages_leaf_ids = [leaf_ids(r) for r in roots]
+    
+    # Pre-calculate free slots for each page (respecting locks)
+    pages_free_slots = []
+    for p in range(num_pages):
+        locked_set = set(locked_leaves[p].keys())
+        pages_free_slots.append([lid for lid in pages_leaf_ids[p] if lid not in locked_set])
+
+    # Inner dimensions for energy calculation
+    page_margin_px = 50 
+    inner_W = page_W - 2 * page_margin_px
+    title_height = int(page_H * 0.1)
+    inner_H = page_H - 2 * page_margin_px - title_height
+
+    # Track individual page energies
+    page_energies = [energy(roots[p], inner_W, inner_H, perms[p], all_prefs) for p in range(num_pages)]
+    E = sum(page_energies)
+    T = 1.5
+
+    for step in tqdm(range(steps), desc="Global Annealing", leave=False):
+        if progress_callback:
+            progress_callback(step, steps)
+
+        move_type = rng.random()
+        
+        if move_type < 0.5:
+            # Structure Move (50%)
+            p_idx = rng.randrange(num_pages)
+            if not pages_internal[p_idx]: continue
+            n = rng.choice(pages_internal[p_idx])
+            
+            old_t = n.t
+            old_dir = n.dir
+            
+            if rng.random() < 0.5:
+                n.t = min(0.95, max(0.05, old_t + rng.gauss(0, 0.1 * T)))
+            else:
+                n.dir = "H" if old_dir == "V" else "V"
+            
+            new_page_E = energy(roots[p_idx], inner_W, inner_H, perms[p_idx], all_prefs)
+            E2 = E - page_energies[p_idx] + new_page_E
+            
+            if E2 <= E or rng.random() < math.exp((E - E2) / max(T, 1e-9)):
+                E = E2
+                page_energies[p_idx] = new_page_E
+            else:
+                n.t = old_t
+                n.dir = old_dir
+        else:
+            # Swap Move (50%)
+            swap_subcase = rng.random()
+            if swap_subcase < 0.33:
+                # Sub-case A: Intra-Page
+                p_idx = rng.randrange(num_pages)
+                free = pages_free_slots[p_idx]
+                if len(free) >= 2:
+                    i, j = rng.sample(free, 2)
+                    perms[p_idx][i], perms[p_idx][j] = perms[p_idx][j], perms[p_idx][i]
+                    
+                    new_page_E = energy(roots[p_idx], inner_W, inner_H, perms[p_idx], all_prefs)
+                    E2 = E - page_energies[p_idx] + new_page_E
+                    
+                    if E2 <= E or rng.random() < math.exp((E - E2) / max(T, 1e-9)):
+                        E = E2
+                        page_energies[p_idx] = new_page_E
+                    else:
+                        perms[p_idx][i], perms[p_idx][j] = perms[p_idx][j], perms[p_idx][i]
+            elif swap_subcase < 0.66:
+                # Sub-case B: Inter-Page
+                if num_pages >= 2:
+                    p1, p2 = rng.sample(range(num_pages), 2)
+                    free1 = pages_free_slots[p1]
+                    free2 = pages_free_slots[p2]
+                    if free1 and free2:
+                        i = rng.choice(free1)
+                        j = rng.choice(free2)
+                        perms[p1][i], perms[p2][j] = perms[p2][j], perms[p1][i]
+                        
+                        new_E1 = energy(roots[p1], inner_W, inner_H, perms[p1], all_prefs)
+                        new_E2 = energy(roots[p2], inner_W, inner_H, perms[p2], all_prefs)
+                        E2 = E - page_energies[p1] - page_energies[p2] + new_E1 + new_E2
+                        
+                        if E2 <= E or rng.random() < math.exp((E - E2) / max(T, 1e-9)):
+                            E = E2
+                            page_energies[p1] = new_E1
+                            page_energies[p2] = new_E2
+                        else:
+                            perms[p1][i], perms[p2][j] = perms[p2][j], perms[p1][i]
+            else:
+                # Sub-case C: Pool Swap
+                if pool:
+                    p_idx = rng.randrange(num_pages)
+                    free = pages_free_slots[p_idx]
+                    if free:
+                        i = rng.choice(free)
+                        k_idx = rng.randrange(len(pool))
+                        perms[p_idx][i], pool[k_idx] = pool[k_idx], perms[p_idx][i]
+                        
+                        new_page_E = energy(roots[p_idx], inner_W, inner_H, perms[p_idx], all_prefs)
+                        E2 = E - page_energies[p_idx] + new_page_E
+                        
+                        if E2 <= E or rng.random() < math.exp((E - E2) / max(T, 1e-9)):
+                            E = E2
+                            page_energies[p_idx] = new_page_E
+                        else:
+                            perms[p_idx][i], pool[k_idx] = pool[k_idx], perms[p_idx][i]
+        
+        T *= 0.9994
+        
+    return perms, pool
 
 # =============================
 # Storyboard (snapshots only)

@@ -6,10 +6,10 @@ from typing import List, Dict, Optional
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QListWidget, QListWidgetItem, 
                              QGraphicsView, QGraphicsScene, QGraphicsRectItem, 
-                             QGraphicsPixmapItem, QFileDialog, QLabel, QProgressBar,
-                             QSplitter, QMessageBox, QFrame, QComboBox, QSpinBox)
+                             QGraphicsPixmapItem, QGraphicsTextItem, QFileDialog, QLabel, QProgressBar,
+                             QSplitter, QMessageBox, QFrame, QComboBox, QSpinBox, QLineEdit)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QMimeData, QPointF
-from PyQt6.QtGui import QPixmap, QDrag, QImage, QPainter, QColor, QPen, QIcon
+from PyQt6.QtGui import QPixmap, QDrag, QImage, QPainter, QColor, QPen, QIcon, QTextDocument
 
 import sa_advanced as sa
 from PIL import Image, ImageOps
@@ -18,7 +18,7 @@ class OptimizationThread(QThread):
     progress = pyqtSignal(int, int)
     finished_optim = pyqtSignal(list)
     
-    def __init__(self, chunks, swap_pool, pages_locks, all_prefs, image_paths, page_W, page_H):
+    def __init__(self, chunks, swap_pool, pages_locks, all_prefs, image_paths, page_W, page_H, title, mode, pages_roots):
         super().__init__()
         self.chunks = chunks
         self.swap_pool = swap_pool.copy()
@@ -27,8 +27,28 @@ class OptimizationThread(QThread):
         self.image_paths = image_paths
         self.page_W = page_W
         self.page_H = page_H
+        self.title = title
+        self.mode = mode
+        self.pages_roots = pages_roots
         
     def run(self):
+        if self.mode == "global":
+            results, final_pool = sa.anneal_global(
+                roots=self.pages_roots,
+                page_W=self.page_W,
+                page_H=self.page_H,
+                all_images=self.image_paths,
+                all_prefs=self.all_prefs,
+                initial_perms=self.chunks,
+                swap_pool=self.swap_pool,
+                locked_leaves=self.pages_locks,
+                steps=10000,
+                progress_callback=self.emit_progress,
+                title=self.title
+            )
+            self.finished_optim.emit(results)
+            return
+
         results = []
         for page_idx, chunk in enumerate(self.chunks):
             current_all_images = [self.image_paths[i] for i in chunk + self.swap_pool]
@@ -56,7 +76,8 @@ class OptimizationThread(QThread):
                 seed=42 + page_idx,
                 desc=f"Optimizing Page {page_idx + 1}",
                 locked_leaves=locked,
-                progress_callback=self.emit_progress
+                progress_callback=self.emit_progress,
+                title=self.title
             )
             # perm is local indices, map back to global indices
             local_to_global = chunk + self.swap_pool
@@ -112,7 +133,7 @@ class AlbumWindow(QMainWindow):
         self.image_paths: List[Path] = []
         self.pages_roots: List[Optional[sa.Node]] = []
         self.pages_perms: List[List[int]] = [] # Each is Maps leaf_id -> image_idx
-        self.pages_locks: List[Dict[int, int]] = {} # Each is leaf_id -> image_idx
+        self.pages_locks: List[Dict[int, int]] = [] # Each is leaf_id -> image_idx
         self.target_leaf_count: Optional[int] = None
         self.all_prefs: List[float] = []
         self.current_page_idx = 0
@@ -160,6 +181,7 @@ class AlbumWindow(QMainWindow):
         self.num_pages_spin = QSpinBox()
         self.num_pages_spin.setMinimum(1)
         self.num_pages_spin.setValue(1)
+        self.num_pages_spin.valueChanged.connect(self.on_page_count_changed)
         num_pages_row.addWidget(num_pages_label)
         num_pages_row.addWidget(self.num_pages_spin)
         right_layout.addLayout(num_pages_row)
@@ -172,6 +194,23 @@ class AlbumWindow(QMainWindow):
         size_row.addWidget(size_label)
         size_row.addWidget(self.slot_combo)
         right_layout.addLayout(size_row)
+        
+        title_row = QHBoxLayout()
+        title_label = QLabel("Page Title")
+        self.title_edit = QLineEdit()
+        self.title_edit.setText("default title")
+        title_row.addWidget(title_label)
+        title_row.addWidget(self.title_edit)
+        right_layout.addLayout(title_row)
+
+        mode_row = QHBoxLayout()
+        mode_label = QLabel("Optimization Mode")
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Sequential (Page by Page)", "sequential")
+        self.mode_combo.addItem("Global (Simultaneous)", "global")
+        mode_row.addWidget(mode_label)
+        mode_row.addWidget(self.mode_combo)
+        right_layout.addLayout(mode_row)
 
         self.optimize_btn = QPushButton("✨ Optimize Layout")
         self.optimize_btn.clicked.connect(self.start_optimization)
@@ -296,6 +335,9 @@ class AlbumWindow(QMainWindow):
         # Changing the slot count invalidates previous locks.
         self.init_trees()
 
+    def on_page_count_changed(self, value):
+        self.init_trees()
+
     def init_trees(self):
         total_images = len(self.image_paths)
         if total_images == 0:
@@ -316,7 +358,15 @@ class AlbumWindow(QMainWindow):
                 self.slot_combo.blockSignals(False)
 
         leaf_count = self.target_leaf_count
-        num_pages = self.num_pages_spin.value()
+        max_possible_pages = max(1, total_images // leaf_count)
+        requested_pages = self.num_pages_spin.value()
+        if requested_pages > max_possible_pages:
+            self.num_pages_spin.blockSignals(True)
+            self.num_pages_spin.setValue(max_possible_pages)
+            self.num_pages_spin.blockSignals(False)
+            num_pages = max_possible_pages
+        else:
+            num_pages = requested_pages
         try:
             self.pages_roots = [sa.build_full_tree(leaf_count, seed=42 + i) for i in range(num_pages)]
         except AssertionError:
@@ -346,10 +396,25 @@ class AlbumWindow(QMainWindow):
         
         margin = 20
         W, H = self.page_W, self.page_H
+        title_height = int(H * 0.1)
         in_W = W - 2*margin
-        in_H = H - 2*margin
+        in_H = H - 2*margin - title_height
         
-        boxes = sa.decode_region(root, margin, margin, in_W, in_H)
+        boxes = sa.decode_region(root, margin, margin + title_height, in_W, in_H)
+        
+        # Draw title
+        title_text = self.title_edit.text()
+        text_item = QGraphicsTextItem()
+        text_document = QTextDocument()
+        text_document.setHtml(f"<div style='text-align: center;'>{title_text}</div>")
+        text_item.setDocument(text_document)
+        text_item.setPos(margin, margin)
+        text_item.setTextWidth(W - 2*margin)
+        font = text_item.font()
+        font.setPixelSize(int(title_height * 0.4))
+        text_item.setFont(font)
+        text_item.setDefaultTextColor(QColor(0, 0, 0))
+        self.scene.addItem(text_item)
         
         gap = 10
         
@@ -441,13 +506,31 @@ class AlbumWindow(QMainWindow):
             QMessageBox.warning(self, "Not Enough Images", f"You need at least {total_needed} images for {num_pages} pages with {slots_per_page} slots each, but only {len(active_indices)} are selected.")
             return
 
-        # Slice into chunks
-        chunks = [active_indices[i*slots_per_page:(i+1)*slots_per_page] for i in range(num_pages)]
-        swap_pool = active_indices[total_needed:]
+        # Initialize buckets
+        chunks = [[] for _ in range(num_pages)]
+        assigned = set()
+
+        # Identify and assign locked images
+        for p in range(num_pages):
+            for leaf_id, img_idx in self.pages_locks[p].items():
+                if img_idx in active_indices and img_idx not in assigned:
+                    chunks[p].append(img_idx)
+                    assigned.add(img_idx)
+
+        # Distribute remaining images
+        free_images = [idx for idx in active_indices if idx not in assigned]
+        for p in range(num_pages):
+            while len(chunks[p]) < slots_per_page and free_images:
+                chunks[p].append(free_images.pop(0))
+
+        # Create swap pool
+        swap_pool = free_images
 
         # Prepare for thread
+        title = self.title_edit.text()
+        mode = self.mode_combo.currentData()
         self.worker = OptimizationThread(
-            chunks, swap_pool, self.pages_locks, self.all_prefs, self.image_paths, self.page_W, self.page_H
+            chunks, swap_pool, self.pages_locks, self.all_prefs, self.image_paths, self.page_W, self.page_H, title, mode, self.pages_roots
         )
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.finished_optim.connect(self.finished_optimization)
