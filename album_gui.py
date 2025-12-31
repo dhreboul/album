@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QListWidget, QListWidgetItem, 
                              QGraphicsView, QGraphicsScene, QGraphicsRectItem, 
                              QGraphicsPixmapItem, QGraphicsTextItem, QFileDialog, QLabel, QProgressBar,
-                             QSplitter, QMessageBox, QFrame, QComboBox, QSpinBox, QLineEdit)
+                             QSplitter, QMessageBox, QFrame, QComboBox, QSpinBox, QLineEdit, QCheckBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QMimeData, QPointF
 from PyQt6.QtGui import QPixmap, QDrag, QImage, QPainter, QColor, QPen, QIcon, QTextDocument
 
@@ -21,7 +21,7 @@ class OptimizationThread(QThread):
     progress = pyqtSignal(int, int)
     finished_optim = pyqtSignal(list, list)
     
-    def __init__(self, chunks, swap_pool, pages_locks, all_prefs, image_paths, page_W, page_H, title, mode, pages_roots, steps):
+    def __init__(self, chunks, swap_pool, pages_locks, all_prefs, image_paths, page_W, page_H, title, pages_roots, steps, crop_to_fit=True):
         super().__init__()
         self.chunks = chunks
         self.swap_pool = swap_pool.copy()
@@ -31,70 +31,25 @@ class OptimizationThread(QThread):
         self.page_W = page_W
         self.page_H = page_H
         self.title = title
-        self.mode = mode
         self.pages_roots = pages_roots
         self.steps = steps
+        self.crop_to_fit = crop_to_fit
         
     def run(self):
-        if self.mode == "global":
-            results, final_pool, energy_history = sa.anneal_global(
-                roots=self.pages_roots,
-                page_W=self.page_W,
-                page_H=self.page_H,
-                all_images=self.image_paths,
-                all_prefs=self.all_prefs,
-                initial_perms=self.chunks,
-                swap_pool=self.swap_pool,
-                locked_leaves=self.pages_locks,
-                steps=self.steps,
-                progress_callback=self.emit_progress,
-                title=self.title
-            )
-            self.finished_optim.emit(results, energy_history)
-            return
-
-        results = []
-        total_energy_history = []
-        for page_idx, chunk in enumerate(self.chunks):
-            current_all_images = [self.image_paths[i] for i in chunk + self.swap_pool]
-            current_all_prefs = [self.all_prefs[i] for i in chunk + self.swap_pool]
-            
-            # Map locked to local indices
-            locked = {}
-            for leaf_id, global_img_idx in self.pages_locks[page_idx].items():
-                if global_img_idx in chunk + self.swap_pool:
-                    local_idx = (chunk + self.swap_pool).index(global_img_idx)
-                    locked[leaf_id] = local_idx
-            
-            root = sa.build_full_tree(len(chunk), seed=42 + page_idx)
-            
-            perm, _, energy_history = sa.anneal_with_snapshots(
-                root=root,
-                page_W=self.page_W,
-                page_H=self.page_H,
-                all_images=current_all_images,
-                all_prefs=current_all_prefs,
-                page_margin_px=50,
-                gap_px=20,
-                steps=self.steps,
-                snapshots_count=0,
-                seed=42 + page_idx,
-                desc=f"Optimizing Page {page_idx + 1}",
-                locked_leaves=locked,
-                progress_callback=self.emit_progress,
-                title=self.title
-            )
-            total_energy_history.extend(energy_history)
-            # perm is local indices, map back to global indices
-            local_to_global = chunk + self.swap_pool
-            global_perm = [local_to_global[local_idx] for local_idx in perm]
-            results.append(global_perm)
-            
-            # Remove used images from swap_pool
-            used = set(global_perm)
-            self.swap_pool = [img for img in self.swap_pool if img not in used]
-        
-        self.finished_optim.emit(results, total_energy_history)
+        results, final_pool, energy_history = sa.anneal_global(
+            roots=self.pages_roots,
+            page_W=self.page_W,
+            page_H=self.page_H,
+            all_images=self.image_paths,
+            all_prefs=self.all_prefs,
+            initial_perms=self.chunks,
+            swap_pool=self.swap_pool,
+            locked_leaves=self.pages_locks,
+            steps=self.steps,
+            progress_callback=self.emit_progress,
+            title=self.title
+        )
+        self.finished_optim.emit(results, energy_history)
         
     def emit_progress(self, step, total):
         self.progress.emit(step, total)
@@ -103,13 +58,14 @@ class ExportThread(QThread):
     progress = pyqtSignal(int, int)
     finished = pyqtSignal(bool, str)
     
-    def __init__(self, output_path, pages_roots, pages_perms, image_paths, title):
+    def __init__(self, output_path, pages_roots, pages_perms, image_paths, title, crop_to_fit=True):
         super().__init__()
         self.output_path = output_path
         self.pages_roots = pages_roots
         self.pages_perms = pages_perms
         self.image_paths = image_paths
         self.title = title
+        self.crop_to_fit = crop_to_fit
         self.export_W = 2480
         self.export_H = 3508
         
@@ -129,7 +85,8 @@ class ExportThread(QThread):
                     perm=perm,
                     page_margin_px=120,
                     gap_px=40,
-                    title=self.title
+                    title=self.title,
+                    crop_to_fit=self.crop_to_fit
                 )
                 pdf_pages.append(page_img)
                 self.progress.emit(i + 1, total)
@@ -146,13 +103,14 @@ class ExportThread(QThread):
             self.finished.emit(False, str(e))
 
 class LeafItem(QGraphicsRectItem):
-    def __init__(self, x, y, w, h, leaf_id, parent_gui):
+    def __init__(self, x, y, w, h, page_idx, leaf_id, parent_gui):
         super().__init__(x, y, w, h)
+        self.page_idx = page_idx
         self.leaf_id = leaf_id
         self.parent_gui = parent_gui
         self.setAcceptDrops(True)
         self.setPen(QPen(Qt.GlobalColor.black))
-        self.setBrush(QColor(240, 240, 240))
+        self.setBrush(QColor(255, 255, 255))
         
         self.pixmap_item = QGraphicsPixmapItem(self)
         self.pixmap_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
@@ -170,7 +128,7 @@ class LeafItem(QGraphicsRectItem):
         if event.mimeData().hasFormat("application/x-image-idx"):
             data = event.mimeData().data("application/x-image-idx")
             img_idx = int(data.data().decode())
-            self.parent_gui.handle_drop(self.leaf_id, img_idx)
+            self.parent_gui.handle_drop(self.page_idx, self.leaf_id, img_idx)
             event.accept()
         else:
             event.ignore()
@@ -189,6 +147,7 @@ class AlbumWindow(QMainWindow):
         self.target_leaf_count: Optional[int] = None
         self.all_prefs: List[float] = []
         self.current_page_idx = 0
+        self.view_mode = "single" # "single" or "grid"
         
         self.page_W = 1000  # Internal logic size
         self.page_H = 1414  # ~A4 Aspect
@@ -255,15 +214,6 @@ class AlbumWindow(QMainWindow):
         title_row.addWidget(self.title_edit)
         right_layout.addLayout(title_row)
 
-        mode_row = QHBoxLayout()
-        mode_label = QLabel("Optimization Mode")
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItem("Sequential (Page by Page)", "sequential")
-        self.mode_combo.addItem("Global (Simultaneous)", "global")
-        mode_row.addWidget(mode_label)
-        mode_row.addWidget(self.mode_combo)
-        right_layout.addLayout(mode_row)
-
         steps_row = QHBoxLayout()
         steps_label = QLabel("Annealing Steps")
         self.steps_spin = QSpinBox()
@@ -274,6 +224,11 @@ class AlbumWindow(QMainWindow):
         steps_row.addWidget(steps_label)
         steps_row.addWidget(self.steps_spin)
         right_layout.addLayout(steps_row)
+
+        self.crop_checkbox = QCheckBox("Crop Images to Fill Slots")
+        self.crop_checkbox.setChecked(True)
+        self.crop_checkbox.stateChanged.connect(self.draw_layout)
+        right_layout.addWidget(self.crop_checkbox)
 
         self.optimize_btn = QPushButton("✨ Optimize Layout")
         self.optimize_btn.clicked.connect(self.start_optimization)
@@ -322,10 +277,16 @@ class AlbumWindow(QMainWindow):
         self.page_label = QLabel("Page 1 / 1")
         self.next_btn = QPushButton("Next Page")
         self.next_btn.clicked.connect(self.next_page)
+        
+        self.grid_view_btn = QPushButton("Grid View")
+        self.grid_view_btn.setCheckable(True)
+        self.grid_view_btn.clicked.connect(self.toggle_view_mode)
+        
         bottom_layout.addWidget(self.prev_btn)
         bottom_layout.addStretch()
         bottom_layout.addWidget(self.page_label)
         bottom_layout.addStretch()
+        bottom_layout.addWidget(self.grid_view_btn)
         bottom_layout.addWidget(self.next_btn)
         main_layout.addLayout(bottom_layout)
 
@@ -464,12 +425,41 @@ class AlbumWindow(QMainWindow):
 
     def draw_layout(self):
         self.scene.clear()
-        if not self.pages_roots or self.current_page_idx >= len(self.pages_roots) or not self.pages_perms[self.current_page_idx]:
+        if not self.pages_roots:
             return
         
-        root = self.pages_roots[self.current_page_idx]
-        perm = self.pages_perms[self.current_page_idx]
-        locked = self.pages_locks[self.current_page_idx]
+        if self.view_mode == "single":
+            if self.current_page_idx >= len(self.pages_roots):
+                return
+            self.render_page_to_scene(self.current_page_idx, 0, 0)
+        else:
+            # Grid View
+            cols = 3
+            visual_gap = 100
+            for i in range(len(self.pages_roots)):
+                row = i // cols
+                col = i % cols
+                x_offset = col * (self.page_W + visual_gap)
+                y_offset = row * (self.page_H + visual_gap)
+                self.render_page_to_scene(i, x_offset, y_offset)
+                
+                # Add page label
+                label = QGraphicsTextItem(f"Page {i + 1}")
+                font = label.font()
+                font.setPixelSize(40)
+                font.setBold(True)
+                label.setFont(font)
+                label.setDefaultTextColor(QColor(200, 200, 200))
+                label.setPos(x_offset, y_offset - 60)
+                self.scene.addItem(label)
+
+        self.scene.setSceneRect(self.scene.itemsBoundingRect())
+        self.view.fitInView(self.scene.itemsBoundingRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+    def render_page_to_scene(self, page_idx, x_offset, y_offset):
+        root = self.pages_roots[page_idx]
+        perm = self.pages_perms[page_idx]
+        locked = self.pages_locks[page_idx]
         
         margin = 20
         W, H = self.page_W, self.page_H
@@ -477,6 +467,12 @@ class AlbumWindow(QMainWindow):
         in_W = W - 2*margin
         in_H = H - 2*margin - title_height
         
+        # Draw page background
+        bg_rect = QGraphicsRectItem(x_offset, y_offset, W, H)
+        bg_rect.setBrush(QColor(255, 255, 255))
+        bg_rect.setPen(QPen(Qt.GlobalColor.black, 2))
+        self.scene.addItem(bg_rect)
+
         boxes = sa.decode_region(root, margin, margin + title_height, in_W, in_H)
         
         # Draw title
@@ -485,7 +481,7 @@ class AlbumWindow(QMainWindow):
         text_document = QTextDocument()
         text_document.setHtml(f"<div style='text-align: center;'>{title_text}</div>")
         text_item.setDocument(text_document)
-        text_item.setPos(margin, margin)
+        text_item.setPos(x_offset + margin, y_offset + margin)
         text_item.setTextWidth(W - 2*margin)
         font = text_item.font()
         font.setPixelSize(int(title_height * 0.4))
@@ -499,9 +495,9 @@ class AlbumWindow(QMainWindow):
             # Apply gap
             rect_item = LeafItem(
                 0, 0, w - gap, h - gap, 
-                leaf_id, self
+                page_idx, leaf_id, self
             )
-            rect_item.setPos(x + gap/2, y + gap/2)
+            rect_item.setPos(x_offset + x + gap/2, y_offset + y + gap/2)
             
             if leaf_id >= len(perm):
                 continue
@@ -511,41 +507,39 @@ class AlbumWindow(QMainWindow):
             
             # Load image to display in rect
             path = self.image_paths[img_idx]
-            # We need to fit image
             pix = QPixmap(str(path))
             if not pix.isNull():
-                 # Scale exactly to fit? Or AspectFit? 
-                 # sa logic uses ImageOps.fit (crop to fill).
-                 # Let's emulate crop to fill for preview.
-                 scaled = pix.scaled(int(w-gap), int(h-gap), Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-                 # Crop center
-                 copy = scaled.copy(
-                     (scaled.width() - int(w-gap)) // 2,
-                     (scaled.height() - int(h-gap)) // 2,
-                     int(w-gap), int(h-gap)
-                 )
-                 rect_item.pixmap_item.setPixmap(copy)
+                 if self.crop_checkbox.isChecked():
+                    scaled = pix.scaled(int(w-gap), int(h-gap), Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+                    copy = scaled.copy(
+                        (scaled.width() - int(w-gap)) // 2,
+                        (scaled.height() - int(h-gap)) // 2,
+                        int(w-gap), int(h-gap)
+                    )
+                    rect_item.pixmap_item.setPixmap(copy)
+                 else:
+                    scaled = pix.scaled(int(w-gap), int(h-gap), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                    rect_item.pixmap_item.setPixmap(scaled)
+                    rect_item.pixmap_item.setPos((w - gap - scaled.width()) / 2, (h - gap - scaled.height()) / 2)
             
             if leaf_id in locked:
                 rect_item.is_locked = True
                 
             self.scene.addItem(rect_item)
-            
-        self.view.fitInView(self.scene.itemsBoundingRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
-    def handle_drop(self, leaf_id, img_idx):
-        # User dropped image `img_idx` onto `leaf_id`.
+    def handle_drop(self, page_idx, leaf_id, img_idx):
+        # User dropped image `img_idx` onto `leaf_id` of `page_idx`.
         # Constraint: Image `img_idx` MUST be at `leaf_id`.
-        if not self.pages_roots or self.current_page_idx >= len(self.pages_roots) or not self.pages_perms[self.current_page_idx]:
+        if not self.pages_roots or page_idx >= len(self.pages_roots) or not self.pages_perms[page_idx]:
             return
-        perm = self.pages_perms[self.current_page_idx]
-        locked = self.pages_locks[self.current_page_idx]
+        perm = self.pages_perms[page_idx]
+        locked = self.pages_locks[page_idx]
         if leaf_id < 0 or leaf_id >= len(perm):
             return
         if img_idx < 0 or img_idx >= len(self.image_paths):
             return
 
-        # Remove any previous lock that tied this image to a different leaf.
+        # Remove any previous lock that tied this image to a different leaf on the SAME page.
         for locked_leaf, locked_img in list(locked.items()):
             if locked_leaf != leaf_id and locked_img == img_idx:
                 del locked[locked_leaf]
@@ -605,10 +599,10 @@ class AlbumWindow(QMainWindow):
 
         # Prepare for thread
         title = self.title_edit.text()
-        mode = self.mode_combo.currentData()
         steps = self.steps_spin.value()
         self.worker = OptimizationThread(
-            chunks, swap_pool, self.pages_locks, self.all_prefs, self.image_paths, self.page_W, self.page_H, title, mode, self.pages_roots, steps
+            chunks, swap_pool, self.pages_locks, self.all_prefs, self.image_paths, self.page_W, self.page_H, title, self.pages_roots, steps,
+            crop_to_fit=self.crop_checkbox.isChecked()
         )
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.finished_optim.connect(self.on_optim_finished)
@@ -650,7 +644,8 @@ class AlbumWindow(QMainWindow):
             
             title = self.title_edit.text()
             self.export_worker = ExportThread(
-                path, self.pages_roots, self.pages_perms, self.image_paths, title
+                path, self.pages_roots, self.pages_perms, self.image_paths, title,
+                crop_to_fit=self.crop_checkbox.isChecked()
             )
             self.export_worker.progress.connect(self.progress_bar.setValue)
             self.export_worker.finished.connect(self.on_export_finished)
@@ -669,6 +664,16 @@ class AlbumWindow(QMainWindow):
             locks.clear()
         self.init_trees() # Re-randomize
 
+    def toggle_view_mode(self):
+        if self.grid_view_btn.isChecked():
+            self.view_mode = "grid"
+            self.grid_view_btn.setText("Single View")
+        else:
+            self.view_mode = "single"
+            self.grid_view_btn.setText("Grid View")
+        self.update_page_nav()
+        self.draw_layout()
+
     def prev_page(self):
         if self.current_page_idx > 0:
             self.current_page_idx -= 1
@@ -685,6 +690,10 @@ class AlbumWindow(QMainWindow):
         num_pages = len(self.pages_roots)
         if num_pages == 0:
             self.page_label.setText("Page 0 / 0")
+            self.prev_btn.setEnabled(False)
+            self.next_btn.setEnabled(False)
+        elif self.view_mode == "grid":
+            self.page_label.setText(f"All Pages ({num_pages})")
             self.prev_btn.setEnabled(False)
             self.next_btn.setEnabled(False)
         else:
