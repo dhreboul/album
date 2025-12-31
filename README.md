@@ -1,15 +1,14 @@
-```markdown
 # Esthetic Album Designer
 
-**Esthetic Album Designer** is an intelligent photo layout generation tool that uses **Simulated Annealing** to automatically arrange images into aesthetically pleasing collages. 
+**Esthetic Album Designer** is an intelligent photo layout generation tool that uses **Simulated Annealing** to automatically arrange images into aesthetically pleasing collages.
 
 Unlike standard grid layouts, this tool optimizes the size and position of every photo slot to match the aspect ratio of your specific images, minimizing awkward cropping while maintaining a perfectly aligned "guillotine" cut structure. It includes a GUI for interactive design and specific image placement.
 
 ## 🌟 Features
 
 *   **Automatic Layout Optimization:** Uses a physics-inspired algorithm to find the best layout for a set of images.
-*   **Aspect Ratio Matching:** intelligently pairs landscape slots with landscape images (and portrait with portrait) to preserve image content.
-*   **Interactive GUI:** 
+*   **Aspect Ratio Matching:** Intelligently pairs landscape slots with landscape images (and portrait with portrait) to preserve image content.
+*   **Interactive GUI:**
     *   Drag-and-drop images to specific slots to "lock" them in place.
     *   Visualize the optimization process.
 *   **Guillotine Slicing Structure:** Generates layouts that can be physically cut using a paper cutter (recursive horizontal/vertical splits).
@@ -23,18 +22,14 @@ Unlike standard grid layouts, this tool optimizes the size and position of every
 ### Setup
 1.  **Clone or Download** the repository.
 2.  **Install Dependencies**:
-    ```bash
-    pip install PyQt6 Pillow tqdm
-    ```
+    `pip install PyQt6 Pillow tqdm`
 
 ## 🚀 Usage
 
 ### 1. Graphical User Interface (Recommended)
 The GUI allows you to load a folder, visualize the layout, and manually constrain specific photos to specific positions before optimizing.
 
-```bash
-python album_gui.py
-```
+`python album_gui.py`
 
 *   **Load Folder:** Select a directory containing images (JPG, PNG, WEBP).
 *   **Locking:** Drag an image from the left sidebar onto a specific slot in the layout. This "locks" that image to that specific rectangle.
@@ -45,9 +40,7 @@ You can run the advanced script directly to generate multi-page storyboards from
 
 Open `sa_advanced.py` and modify the parameters at the bottom of the file (in the `if __name__ == "__main__":` block), then run:
 
-```bash
-python sa_advanced.py
-```
+`python sa_advanced.py`
 
 ## 🧠 How It Works: The Algorithm
 
@@ -74,34 +67,38 @@ The algorithm starts with a random layout and iteratively attempts to improve it
 3.  **Energy Calculation:** Calculate how "bad" the new layout is (see math below).
 4.  **Acceptance Criterion:**
     *   If the new Energy is lower (better), accept the change.
-    *   If the new Energy is higher (worse), accept it with probability $P = e^{-\Delta E / T}$.
+    *   If the new Energy is higher (worse), accept it with probability **P = e^(-ΔE / T)**.
     *   *Note:* This allows the algorithm to escape local optima by occasionally accepting bad moves early on.
-5.  **Cooling:** Decrease the Temperature $T$ slightly ($T_{new} = T_{old} \times 0.9994$). As $T$ approaches 0, the algorithm stops accepting bad moves and settles into a final solution.
+5.  **Cooling:** Decrease the Temperature **T** slightly (**T_new = T_old * 0.9994**). As **T** approaches 0, the algorithm stops accepting bad moves and settles into a final solution.
 
 ### 3. The Mathematics (Energy Function)
-The "Energy" ($E$) defines what makes a layout look good. It is calculated as:
+The "Energy" (**E**) defines what makes a layout look good. It is calculated as:
 
-$$ E = \sum_{leaves} (E_{shape} + E_{area}) + E_{regularization} $$
+**E = Σ (E_shape + E_area) + E_regularization**
 
-#### A. Shape Error ($E_{shape}$)
+#### A. Shape Error (E_shape)
 This ensures the slot shape matches the image content to minimize cropping.
-$$ E_{shape} = (\ln(\frac{\rho}{a}))^2 $$
-*   $\rho$: The aspect ratio of the slot (width/height).
-*   $a$: The preferred aspect ratio of the image inside that slot.
-*   *Why Log?* Using a natural log ensures that a $2:1$ mismatch is penalized exactly the same as a $1:2$ mismatch.
 
-#### B. Area Error ($E_{area}$)
+**E_shape = (ln(ρ / a))²**
+
+*   **ρ**: The aspect ratio of the slot (width/height).
+*   **a**: The preferred aspect ratio of the image inside that slot.
+*   *Why Log?* Using a natural log ensures that a 2:1 mismatch is penalized exactly the same as a 1:2 mismatch.
+
+#### B. Area Error (E_area)
 This ensures all images get roughly equal screen space.
-$$ E_{area} = (\frac{area_{slot} - area_{target}}{area_{target}})^2 $$
+
+**E_area = ((area_slot - area_target) / area_target)²**
 
 #### C. Regularization
 This prevents the algorithm from creating impossibly thin slivers (e.g., a cut at 1% width).
-$$ E_{reg} = 0.02 \times (\ln(\frac{t}{1-t}))^2 $$
-This term shoots to infinity as the cut ratio $t$ approaches 0 or 1, forcing cuts to stay central.
+
+**E_reg = 0.02 * (ln(t / (1 - t)))²**
+
+This term shoots to infinity as the cut ratio **t** approaches 0 or 1, forcing cuts to stay central.
 
 ## 📂 File Structure
 
-*   **`album_gui.py`**: The PyQt6 application entry point. Handles UI, drag-and-drop logic, and threads the optimization.
-*   **`sa_advanced.py`**: The backend logic. Contains the Tree class, the Energy function, the Simulated Annealing loop, and image rendering code.
-*   **`pyproject.toml`**: Project metadata and dependencies.
-```
+*   `album_gui.py`: The PyQt6 application entry point. Handles UI, drag-and-drop logic, and threads the optimization.
+*   `sa_advanced.py`: The backend logic. Contains the Tree class, the Energy function, the Simulated Annealing loop, and image rendering code.
+*   `pyproject.toml`: Project metadata and dependencies.
